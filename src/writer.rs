@@ -207,7 +207,15 @@ pub fn flush(
     }
     writer.write().context("Failed to write LD data to buffer")?;
 
-    let ld_bytes = buf.into_inner();
+    let mut ld_bytes = buf.into_inner();
+
+    // The motec-i2 crate writes 0xD20822 at the "pro_logging" field (byte offset 1502),
+    // taken from a standard non-Pro demo file. MoTeC i2 Pro requires 0x000C81A4 here.
+    // Patch it so the file is recognised as Pro-enabled and opens in i2 Pro.
+    // Reference: https://github.com/gotzl/ldparser (ldparser.py ldHead.write())
+    if ld_bytes.len() > 1505 {
+        ld_bytes[1502..1506].copy_from_slice(&0x000C81A4u32.to_le_bytes());
+    }
 
     // Ensure output directory exists
     fs.create_dir_all(output_dir)
