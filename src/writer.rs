@@ -207,7 +207,12 @@ pub fn flush(
     }
     writer.write().context("Failed to write LD data to buffer")?;
 
-    let ld_bytes = buf.into_inner();
+    let mut ld_bytes = buf.into_inner();
+
+    // The crate hardcodes 0x0080 for the device-options field (offset 84).
+    // 0xADB0 is required for MoTeC i2 Pro to show "Pro Logging".
+    ld_bytes[DEVICE_OPTIONS_OFFSET..DEVICE_OPTIONS_OFFSET + 2]
+        .copy_from_slice(&PRO_DEVICE_OPTIONS.to_le_bytes());
 
     // Ensure output directory exists
     fs.create_dir_all(output_dir)
@@ -239,6 +244,11 @@ const PRO_DEVICE_SERIAL: u32 = 12007;
 const PRO_DEVICE_TYPE: &[u8; 8] = b"ADL\0\0\0\0\0";
 const PRO_DEVICE_VERSION: u16 = 420;
 
+// Byte offset of the "device options" field (a u16 immediately after device_version).
+// The motec-i2 crate hardcodes 0x0080 here; the Python ldparser uses 0xADB0 for Pro Logging.
+const DEVICE_OPTIONS_OFFSET: usize = 84;
+const PRO_DEVICE_OPTIONS: u16 = 0xADB0;
+
 /// Patch an existing `.ld` file so that MoTeC i2 Pro will open it.
 ///
 /// Sets `device_serial = 12007`, `device_type = "ADL"`, `device_version = 420`
@@ -252,7 +262,7 @@ pub fn convert_to_pro(input: &Path, output: &Path) -> Result<bool> {
     let mut bytes = fs::read(input)
         .with_context(|| format!("Failed to read '{}'", input.display()))?;
 
-    if bytes.len() < DEVICE_VERSION_OFFSET + 2 {
+    if bytes.len() < DEVICE_OPTIONS_OFFSET + 2 {
         bail!(
             "'{}' is too small ({} bytes) to be a valid .ld file",
             input.display(),
@@ -271,11 +281,13 @@ pub fn convert_to_pro(input: &Path, output: &Path) -> Result<bool> {
         );
     }
 
-    // Check if device fields already match Pro values
+    // Check if all four Pro fields already match
     let already_pro =
         &bytes[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 8] == PRO_DEVICE_TYPE
         && u16::from_le_bytes([bytes[DEVICE_VERSION_OFFSET], bytes[DEVICE_VERSION_OFFSET + 1]])
-            == PRO_DEVICE_VERSION;
+            == PRO_DEVICE_VERSION
+        && u16::from_le_bytes([bytes[DEVICE_OPTIONS_OFFSET], bytes[DEVICE_OPTIONS_OFFSET + 1]])
+            == PRO_DEVICE_OPTIONS;
 
     if already_pro {
         return Ok(false);
@@ -287,6 +299,8 @@ pub fn convert_to_pro(input: &Path, output: &Path) -> Result<bool> {
         .copy_from_slice(PRO_DEVICE_TYPE);
     bytes[DEVICE_VERSION_OFFSET..DEVICE_VERSION_OFFSET + 2]
         .copy_from_slice(&PRO_DEVICE_VERSION.to_le_bytes());
+    bytes[DEVICE_OPTIONS_OFFSET..DEVICE_OPTIONS_OFFSET + 2]
+        .copy_from_slice(&PRO_DEVICE_OPTIONS.to_le_bytes());
 
     // Create output parent directory if needed
     if let Some(parent) = output.parent() {
@@ -561,21 +575,23 @@ mod tests {
     // --- convert_to_pro tests ---
 
     /// Build a minimal mock .ld file with controllable device fields.
-    fn make_mock_ld(device_type: &[u8; 8], device_version: u16) -> Vec<u8> {
+    fn make_mock_ld(device_type: &[u8; 8], device_version: u16, device_options: u16) -> Vec<u8> {
         let mut bytes = vec![0u8; 200];
         bytes[0..4].copy_from_slice(&LD_MARKER.to_le_bytes());
         bytes[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 8].copy_from_slice(device_type);
         bytes[DEVICE_VERSION_OFFSET..DEVICE_VERSION_OFFSET + 2]
             .copy_from_slice(&device_version.to_le_bytes());
+        bytes[DEVICE_OPTIONS_OFFSET..DEVICE_OPTIONS_OFFSET + 2]
+            .copy_from_slice(&device_options.to_le_bytes());
         bytes
     }
 
     fn non_pro_mock() -> Vec<u8> {
-        make_mock_ld(b"Graffit\0", 1)
+        make_mock_ld(b"Graffit\0", 1, 0x0080)
     }
 
     fn pro_mock() -> Vec<u8> {
-        make_mock_ld(PRO_DEVICE_TYPE, PRO_DEVICE_VERSION)
+        make_mock_ld(PRO_DEVICE_TYPE, PRO_DEVICE_VERSION, PRO_DEVICE_OPTIONS)
     }
 
     #[test]
