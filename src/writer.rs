@@ -232,6 +232,76 @@ pub fn flush(
     Ok(final_path)
 }
 
+/// The pro_logging marker value recognised by MoTeC i2 Pro.
+pub const PRO_LOGGING_MARKER: u32 = 0x000C81A4;
+/// Byte offset of the pro_logging field inside a MoTeC .ld file.
+const PRO_LOGGING_OFFSET: usize = 1502;
+/// Standard LD file marker (first 4 bytes, little-endian).
+const LD_MARKER: u32 = 0x00000040;
+
+/// Patch an existing `.ld` file so that MoTeC i2 Pro will open it.
+///
+/// Reads `input`, sets the pro_logging field at byte offset 1502 to the Pro
+/// marker (`0x000C81A4`), and writes the result to `output` using an atomic
+/// temp-file + rename.  `input` and `output` may be the same path (in-place).
+///
+/// Returns `Ok(true)` if the file was patched, `Ok(false)` if it was already
+/// Pro-enabled and nothing was changed.
+pub fn convert_to_pro(input: &Path, output: &Path) -> Result<bool> {
+    let mut bytes = fs::read(input)
+        .with_context(|| format!("Failed to read '{}'", input.display()))?;
+
+    if bytes.len() <= PRO_LOGGING_OFFSET + 3 {
+        bail!(
+            "'{}' is too small ({} bytes) to be a valid .ld file",
+            input.display(),
+            bytes.len()
+        );
+    }
+
+    let marker = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if marker != LD_MARKER {
+        bail!(
+            "'{}' does not appear to be a MoTeC .ld file \
+             (expected marker 0x{:08X}, found 0x{:08X})",
+            input.display(),
+            LD_MARKER,
+            marker
+        );
+    }
+
+    let current = u32::from_le_bytes([
+        bytes[PRO_LOGGING_OFFSET],
+        bytes[PRO_LOGGING_OFFSET + 1],
+        bytes[PRO_LOGGING_OFFSET + 2],
+        bytes[PRO_LOGGING_OFFSET + 3],
+    ]);
+    if current == PRO_LOGGING_MARKER {
+        return Ok(false); // already Pro-enabled
+    }
+
+    bytes[PRO_LOGGING_OFFSET..PRO_LOGGING_OFFSET + 4]
+        .copy_from_slice(&PRO_LOGGING_MARKER.to_le_bytes());
+
+    // Create output parent directory if needed
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create directory '{}'", parent.display())
+            })?;
+        }
+    }
+
+    // Atomic write: temp file + rename
+    let tmp = output.with_extension("ld.tmp");
+    fs::write(&tmp, &bytes)
+        .with_context(|| format!("Failed to write '{}'", tmp.display()))?;
+    fs::rename(&tmp, output)
+        .with_context(|| format!("Failed to rename '{}' to '{}'", tmp.display(), output.display()))?;
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +551,114 @@ mod tests {
         let path = result.unwrap();
         assert!(nested_dir.exists(), "Output directory should have been created");
         assert!(path.exists(), "LD file should exist in the created directory");
+    }
+
+    // --- convert_to_pro tests ---
+
+    /// Build a minimal mock .ld file: valid LD marker at 0, given pro_logging value at 1502.
+    fn make_mock_ld(pro_logging_val: u32) -> Vec<u8> {
+        let mut bytes = vec![0u8; 2048];
+        bytes[0..4].copy_from_slice(&LD_MARKER.to_le_bytes());
+        bytes[PRO_LOGGING_OFFSET..PRO_LOGGING_OFFSET + 4]
+            .copy_from_slice(&pro_logging_val.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn convert_to_pro_patches_non_pro_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.ld");
+        std::fs::write(&path, make_mock_ld(0x00D20822)).unwrap();
+
+        let result = convert_to_pro(&path, &path).unwrap();
+
+        assert!(result, "should return true (file was patched)");
+        let bytes = std::fs::read(&path).unwrap();
+        let patched_val = u32::from_le_bytes([
+            bytes[PRO_LOGGING_OFFSET],
+            bytes[PRO_LOGGING_OFFSET + 1],
+            bytes[PRO_LOGGING_OFFSET + 2],
+            bytes[PRO_LOGGING_OFFSET + 3],
+        ]);
+        assert_eq!(patched_val, PRO_LOGGING_MARKER);
+    }
+
+    #[test]
+    fn convert_to_pro_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.ld");
+        std::fs::write(&path, make_mock_ld(PRO_LOGGING_MARKER)).unwrap();
+
+        let result = convert_to_pro(&path, &path).unwrap();
+
+        assert!(!result, "should return false (already Pro-enabled)");
+        // File contents must be unchanged
+        let bytes = std::fs::read(&path).unwrap();
+        let val = u32::from_le_bytes([
+            bytes[PRO_LOGGING_OFFSET],
+            bytes[PRO_LOGGING_OFFSET + 1],
+            bytes[PRO_LOGGING_OFFSET + 2],
+            bytes[PRO_LOGGING_OFFSET + 3],
+        ]);
+        assert_eq!(val, PRO_LOGGING_MARKER);
+    }
+
+    #[test]
+    fn convert_to_pro_writes_to_separate_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("original.ld");
+        let output = dir.path().join("pro.ld");
+        let mock = make_mock_ld(0x00D20822);
+        std::fs::write(&input, &mock).unwrap();
+
+        convert_to_pro(&input, &output).unwrap();
+
+        // Output exists and is Pro-enabled
+        assert!(output.exists());
+        let bytes = std::fs::read(&output).unwrap();
+        let val = u32::from_le_bytes([
+            bytes[PRO_LOGGING_OFFSET],
+            bytes[PRO_LOGGING_OFFSET + 1],
+            bytes[PRO_LOGGING_OFFSET + 2],
+            bytes[PRO_LOGGING_OFFSET + 3],
+        ]);
+        assert_eq!(val, PRO_LOGGING_MARKER);
+        // Input is unchanged
+        assert_eq!(std::fs::read(&input).unwrap(), mock);
+    }
+
+    #[test]
+    fn convert_to_pro_creates_output_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("session.ld");
+        let output = dir.path().join("pro").join("session.ld");
+        std::fs::write(&input, make_mock_ld(0x00D20822)).unwrap();
+
+        assert!(!dir.path().join("pro").exists());
+        convert_to_pro(&input, &output).unwrap();
+        assert!(output.exists(), "output file should be created with its parent dir");
+    }
+
+    #[test]
+    fn convert_to_pro_rejects_file_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.ld");
+        std::fs::write(&path, &[0x40u8, 0, 0, 0, 0, 0, 0, 0]).unwrap(); // only 8 bytes
+
+        let err = convert_to_pro(&path, &path).unwrap_err();
+        assert!(err.to_string().contains("too small"), "error: {}", err);
+    }
+
+    #[test]
+    fn convert_to_pro_rejects_non_ld_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notld.ld");
+        // Wrong marker (0xDEADBEEF instead of 0x40)
+        let mut bytes = vec![0u8; 2048];
+        bytes[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = convert_to_pro(&path, &path).unwrap_err();
+        assert!(err.to_string().contains("does not appear to be"), "error: {}", err);
     }
 }

@@ -18,12 +18,34 @@ use listener::{F1Packet, UdpPacketSource};
 use session::{generate_filename, SessionState};
 use writer::{RealFileSystem, SessionMetadata};
 
-/// Parse CLI arguments. Supports an optional `--output-dir <path>` flag.
-/// Returns the output directory path (defaults to current directory).
-fn parse_args() -> PathBuf {
-    let args: Vec<String> = std::env::args().collect();
-    let mut output_dir = PathBuf::from(".");
+enum Args {
+    /// Listen for F1 24 UDP telemetry and write .ld files.
+    Listen { output_dir: PathBuf },
+    /// Patch an existing .ld file to be MoTeC i2 Pro-enabled.
+    Convert { input: PathBuf, output: PathBuf },
+}
 
+fn parse_args() -> Args {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.get(1).map(String::as_str) == Some("convert") {
+        // graffiti convert <input.ld> [<output.ld>]
+        if args.len() < 3 {
+            eprintln!("Usage: graffiti convert <input.ld> [<output.ld>]");
+            eprintln!("  If <output.ld> is omitted the file is patched in-place.");
+            std::process::exit(1);
+        }
+        let input = PathBuf::from(&args[2]);
+        let output = if args.len() >= 4 {
+            PathBuf::from(&args[3])
+        } else {
+            input.clone()
+        };
+        return Args::Convert { input, output };
+    }
+
+    // graffiti [--output-dir <path>]
+    let mut output_dir = PathBuf::from(".");
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--output-dir" {
@@ -36,11 +58,13 @@ fn parse_args() -> PathBuf {
             }
         } else {
             eprintln!("Unknown argument: {}", args[i]);
+            eprintln!("Usage:");
+            eprintln!("  graffiti [--output-dir <path>]");
+            eprintln!("  graffiti convert <input.ld> [<output.ld>]");
             std::process::exit(1);
         }
     }
-
-    output_dir
+    Args::Listen { output_dir }
 }
 
 /// Flush a session buffer to an LD file, logging the result.
@@ -79,8 +103,33 @@ fn run() -> Result<()> {
         .target(env_logger::Target::Stderr)
         .init();
 
-    let output_dir = parse_args();
+    match parse_args() {
+        Args::Convert { input, output } => run_convert(&input, &output),
+        Args::Listen { output_dir } => run_listen(output_dir),
+    }
+}
 
+fn run_convert(input: &std::path::Path, output: &std::path::Path) -> Result<()> {
+    match writer::convert_to_pro(input, output)? {
+        true => {
+            if input == output {
+                info!("Patched '{}' → Pro-enabled (in-place)", output.display());
+            } else {
+                info!(
+                    "Converted '{}' → '{}' (Pro-enabled)",
+                    input.display(),
+                    output.display()
+                );
+            }
+        }
+        false => {
+            info!("'{}' is already Pro-enabled — no changes made", input.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_listen(output_dir: PathBuf) -> Result<()> {
     // Bind UDP socket on 0.0.0.0:20777
     let socket = UdpSocket::bind("0.0.0.0:20777")
         .context("Failed to bind UDP socket on 0.0.0.0:20777. Is the port already in use?")?;
