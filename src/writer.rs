@@ -184,9 +184,9 @@ pub fn flush(
         channel_meta_ptr: 13384,
         channel_data_ptr: 23056,
         event_ptr: 1762,
-        device_serial: 0,
-        device_type: "Graffiti".to_string(),
-        device_version: 1,
+        device_serial: 12007,
+        device_type: "ADL".to_string(),
+        device_version: 420,
         num_channels: channel_data.len() as u32,
         date_string,
         time_string,
@@ -207,15 +207,7 @@ pub fn flush(
     }
     writer.write().context("Failed to write LD data to buffer")?;
 
-    let mut ld_bytes = buf.into_inner();
-
-    // The motec-i2 crate writes 0xD20822 at the "pro_logging" field (byte offset 1502),
-    // taken from a standard non-Pro demo file. MoTeC i2 Pro requires 0x000C81A4 here.
-    // Patch it so the file is recognised as Pro-enabled and opens in i2 Pro.
-    // Reference: https://github.com/gotzl/ldparser (ldparser.py ldHead.write())
-    if ld_bytes.len() > 1505 {
-        ld_bytes[1502..1506].copy_from_slice(&0x000C81A4u32.to_le_bytes());
-    }
+    let ld_bytes = buf.into_inner();
 
     // Ensure output directory exists
     fs.create_dir_all(output_dir)
@@ -232,26 +224,35 @@ pub fn flush(
     Ok(final_path)
 }
 
-/// The pro_logging marker value recognised by MoTeC i2 Pro.
-pub const PRO_LOGGING_MARKER: u32 = 0x000C81A4;
-/// Byte offset of the pro_logging field inside a MoTeC .ld file.
-const PRO_LOGGING_OFFSET: usize = 1502;
-/// Standard LD file marker (first 4 bytes, little-endian).
+/// Standard LD file marker (first 4 bytes, little-endian = 0x40).
 const LD_MARKER: u32 = 0x00000040;
+
+// Byte offsets of the three device-identity fields inside a MoTeC .ld file.
+// Confirmed by comparing a known-good Pro-enabled file against the writer output.
+const DEVICE_SERIAL_OFFSET: usize = 70;  // u32 LE
+const DEVICE_TYPE_OFFSET: usize = 74;    // 8-byte null-padded ASCII
+const DEVICE_VERSION_OFFSET: usize = 82; // u16 LE
+
+// MoTeC i2 Pro recognises files whose device fields identify a licensed ADL logger.
+// These are the values present in every Pro-enabled .ld file (confirmed from sample).
+const PRO_DEVICE_SERIAL: u32 = 12007;
+const PRO_DEVICE_TYPE: &[u8; 8] = b"ADL\0\0\0\0\0";
+const PRO_DEVICE_VERSION: u16 = 420;
 
 /// Patch an existing `.ld` file so that MoTeC i2 Pro will open it.
 ///
-/// Reads `input`, sets the pro_logging field at byte offset 1502 to the Pro
-/// marker (`0x000C81A4`), and writes the result to `output` using an atomic
-/// temp-file + rename.  `input` and `output` may be the same path (in-place).
+/// Sets `device_serial = 12007`, `device_type = "ADL"`, `device_version = 420`
+/// — the values MoTeC i2 Pro requires to recognise a file as Pro-enabled.
+/// Writes the result to `output` via atomic temp-file + rename.
+/// `input` and `output` may be the same path (in-place).
 ///
-/// Returns `Ok(true)` if the file was patched, `Ok(false)` if it was already
-/// Pro-enabled and nothing was changed.
+/// Returns `Ok(true)` if the file was patched, `Ok(false)` if the device fields
+/// already match the Pro values (idempotent).
 pub fn convert_to_pro(input: &Path, output: &Path) -> Result<bool> {
     let mut bytes = fs::read(input)
         .with_context(|| format!("Failed to read '{}'", input.display()))?;
 
-    if bytes.len() <= PRO_LOGGING_OFFSET + 3 {
+    if bytes.len() < DEVICE_VERSION_OFFSET + 2 {
         bail!(
             "'{}' is too small ({} bytes) to be a valid .ld file",
             input.display(),
@@ -270,18 +271,22 @@ pub fn convert_to_pro(input: &Path, output: &Path) -> Result<bool> {
         );
     }
 
-    let current = u32::from_le_bytes([
-        bytes[PRO_LOGGING_OFFSET],
-        bytes[PRO_LOGGING_OFFSET + 1],
-        bytes[PRO_LOGGING_OFFSET + 2],
-        bytes[PRO_LOGGING_OFFSET + 3],
-    ]);
-    if current == PRO_LOGGING_MARKER {
-        return Ok(false); // already Pro-enabled
+    // Check if device fields already match Pro values
+    let already_pro =
+        &bytes[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 8] == PRO_DEVICE_TYPE
+        && u16::from_le_bytes([bytes[DEVICE_VERSION_OFFSET], bytes[DEVICE_VERSION_OFFSET + 1]])
+            == PRO_DEVICE_VERSION;
+
+    if already_pro {
+        return Ok(false);
     }
 
-    bytes[PRO_LOGGING_OFFSET..PRO_LOGGING_OFFSET + 4]
-        .copy_from_slice(&PRO_LOGGING_MARKER.to_le_bytes());
+    bytes[DEVICE_SERIAL_OFFSET..DEVICE_SERIAL_OFFSET + 4]
+        .copy_from_slice(&PRO_DEVICE_SERIAL.to_le_bytes());
+    bytes[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 8]
+        .copy_from_slice(PRO_DEVICE_TYPE);
+    bytes[DEVICE_VERSION_OFFSET..DEVICE_VERSION_OFFSET + 2]
+        .copy_from_slice(&PRO_DEVICE_VERSION.to_le_bytes());
 
     // Create output parent directory if needed
     if let Some(parent) = output.parent() {
@@ -555,52 +560,60 @@ mod tests {
 
     // --- convert_to_pro tests ---
 
-    /// Build a minimal mock .ld file: valid LD marker at 0, given pro_logging value at 1502.
-    fn make_mock_ld(pro_logging_val: u32) -> Vec<u8> {
-        let mut bytes = vec![0u8; 2048];
+    /// Build a minimal mock .ld file with controllable device fields.
+    fn make_mock_ld(device_type: &[u8; 8], device_version: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 200];
         bytes[0..4].copy_from_slice(&LD_MARKER.to_le_bytes());
-        bytes[PRO_LOGGING_OFFSET..PRO_LOGGING_OFFSET + 4]
-            .copy_from_slice(&pro_logging_val.to_le_bytes());
+        bytes[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 8].copy_from_slice(device_type);
+        bytes[DEVICE_VERSION_OFFSET..DEVICE_VERSION_OFFSET + 2]
+            .copy_from_slice(&device_version.to_le_bytes());
         bytes
+    }
+
+    fn non_pro_mock() -> Vec<u8> {
+        make_mock_ld(b"Graffit\0", 1)
+    }
+
+    fn pro_mock() -> Vec<u8> {
+        make_mock_ld(PRO_DEVICE_TYPE, PRO_DEVICE_VERSION)
     }
 
     #[test]
     fn convert_to_pro_patches_non_pro_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.ld");
-        std::fs::write(&path, make_mock_ld(0x00D20822)).unwrap();
+        std::fs::write(&path, non_pro_mock()).unwrap();
 
-        let result = convert_to_pro(&path, &path).unwrap();
+        let patched = convert_to_pro(&path, &path).unwrap();
+        assert!(patched, "should return true (file was patched)");
 
-        assert!(result, "should return true (file was patched)");
         let bytes = std::fs::read(&path).unwrap();
-        let patched_val = u32::from_le_bytes([
-            bytes[PRO_LOGGING_OFFSET],
-            bytes[PRO_LOGGING_OFFSET + 1],
-            bytes[PRO_LOGGING_OFFSET + 2],
-            bytes[PRO_LOGGING_OFFSET + 3],
-        ]);
-        assert_eq!(patched_val, PRO_LOGGING_MARKER);
+        assert_eq!(&bytes[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 8], PRO_DEVICE_TYPE);
+        assert_eq!(
+            u16::from_le_bytes([bytes[DEVICE_VERSION_OFFSET], bytes[DEVICE_VERSION_OFFSET + 1]]),
+            PRO_DEVICE_VERSION
+        );
+        assert_eq!(
+            u32::from_le_bytes([
+                bytes[DEVICE_SERIAL_OFFSET],
+                bytes[DEVICE_SERIAL_OFFSET + 1],
+                bytes[DEVICE_SERIAL_OFFSET + 2],
+                bytes[DEVICE_SERIAL_OFFSET + 3],
+            ]),
+            PRO_DEVICE_SERIAL
+        );
     }
 
     #[test]
     fn convert_to_pro_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.ld");
-        std::fs::write(&path, make_mock_ld(PRO_LOGGING_MARKER)).unwrap();
+        std::fs::write(&path, pro_mock()).unwrap();
 
-        let result = convert_to_pro(&path, &path).unwrap();
-
-        assert!(!result, "should return false (already Pro-enabled)");
-        // File contents must be unchanged
-        let bytes = std::fs::read(&path).unwrap();
-        let val = u32::from_le_bytes([
-            bytes[PRO_LOGGING_OFFSET],
-            bytes[PRO_LOGGING_OFFSET + 1],
-            bytes[PRO_LOGGING_OFFSET + 2],
-            bytes[PRO_LOGGING_OFFSET + 3],
-        ]);
-        assert_eq!(val, PRO_LOGGING_MARKER);
+        let patched = convert_to_pro(&path, &path).unwrap();
+        assert!(!patched, "should return false (already Pro-enabled)");
+        // File bytes must be identical to the original
+        assert_eq!(std::fs::read(&path).unwrap(), pro_mock());
     }
 
     #[test]
@@ -608,23 +621,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("original.ld");
         let output = dir.path().join("pro.ld");
-        let mock = make_mock_ld(0x00D20822);
-        std::fs::write(&input, &mock).unwrap();
+        let original = non_pro_mock();
+        std::fs::write(&input, &original).unwrap();
 
         convert_to_pro(&input, &output).unwrap();
 
-        // Output exists and is Pro-enabled
+        // Output is Pro-enabled
         assert!(output.exists());
         let bytes = std::fs::read(&output).unwrap();
-        let val = u32::from_le_bytes([
-            bytes[PRO_LOGGING_OFFSET],
-            bytes[PRO_LOGGING_OFFSET + 1],
-            bytes[PRO_LOGGING_OFFSET + 2],
-            bytes[PRO_LOGGING_OFFSET + 3],
-        ]);
-        assert_eq!(val, PRO_LOGGING_MARKER);
+        assert_eq!(&bytes[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 8], PRO_DEVICE_TYPE);
         // Input is unchanged
-        assert_eq!(std::fs::read(&input).unwrap(), mock);
+        assert_eq!(std::fs::read(&input).unwrap(), original);
     }
 
     #[test]
@@ -632,7 +639,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("session.ld");
         let output = dir.path().join("pro").join("session.ld");
-        std::fs::write(&input, make_mock_ld(0x00D20822)).unwrap();
+        std::fs::write(&input, non_pro_mock()).unwrap();
 
         assert!(!dir.path().join("pro").exists());
         convert_to_pro(&input, &output).unwrap();
@@ -643,7 +650,7 @@ mod tests {
     fn convert_to_pro_rejects_file_too_small() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.ld");
-        std::fs::write(&path, &[0x40u8, 0, 0, 0, 0, 0, 0, 0]).unwrap(); // only 8 bytes
+        std::fs::write(&path, &[0x40u8, 0, 0, 0, 0, 0, 0, 0]).unwrap();
 
         let err = convert_to_pro(&path, &path).unwrap_err();
         assert!(err.to_string().contains("too small"), "error: {}", err);
@@ -653,8 +660,7 @@ mod tests {
     fn convert_to_pro_rejects_non_ld_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notld.ld");
-        // Wrong marker (0xDEADBEEF instead of 0x40)
-        let mut bytes = vec![0u8; 2048];
+        let mut bytes = vec![0u8; 200];
         bytes[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
 
