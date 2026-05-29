@@ -1,0 +1,47 @@
+# Rust build output
+/target/
+
+# Dependency lock file is committed for binary crates (preserves reproducible builds)
+# Cargo.lock intentionally NOT ignored
+
+# Tool output — LD telemetry files produced by graffiti at runtime
+*.ld
+*.ld.tmp
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+
+# Editor — VS Code
+.vscode/
+
+# Editor — JetBrains (CLion, RustRover, etc.)
+.idea/
+
+# Editor — Vim / Neovim
+*.swp
+*.swo
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+Session.vim
+
+# Editor — Emacs
+*~
+\#*\#
+.#*
+
+# Editor — Zed
+.zed/
+
+# Environment and secrets
+.env
+.env.*
+
+# Profiling and benchmarks
+perf.data
+perf.data.old
+flamegraph.svg
